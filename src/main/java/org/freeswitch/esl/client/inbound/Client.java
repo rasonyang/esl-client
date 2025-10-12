@@ -50,11 +50,16 @@ public class Client implements IModEslApi {
 	private final ConcurrentHashMap<String, CompletableFuture<EslEvent>> backgroundJobs =
 			new ConcurrentHashMap<>();
 
+	// Channel-partitioned executors: each channel UUID gets its own single-threaded virtual thread executor
+	// This ensures events for the same channel are processed in order, while different channels can process concurrently
+	private final ConcurrentHashMap<String, ExecutorService> channelExecutors = new ConcurrentHashMap<>();
+
 	private boolean authenticated;
 	private CommandResponse authenticationResponse;
 	private Optional<Context> clientContext = Optional.empty();
 	private Optional<SocketWrapper> socket = Optional.empty();
 	private Optional<Thread> messageReaderThread = Optional.empty();
+	// Executor for events without channel UUID (e.g., HEARTBEAT, system events)
 	private ExecutorService callbackExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
 	public void addEventListener(IEslEventListener listener) {
@@ -352,6 +357,10 @@ public class Client implements IModEslApi {
 				authenticated = false;
 				authenticatorResponded.set(false);
 
+				// Shutdown all channel executors
+				channelExecutors.values().forEach(ExecutorService::shutdown);
+				channelExecutors.clear();
+
 				return response;
 			} else {
 				throw new IllegalStateException("not connected/authenticated");
@@ -377,8 +386,39 @@ public class Client implements IModEslApi {
 		@Override
 		public void eventReceived(final Context ctx, final EslEvent event) {
 			log.debug("Event received [{}]", event);
+
+			// Get channel UUID from event headers
+			String channelUuid = event.getEventHeaders().get("Unique-ID");
+
 			for (final IEslEventListener listener : eventListeners) {
-				callbackExecutor.execute(() -> listener.onEslEvent(ctx, event));
+				if (channelUuid != null && !channelUuid.isEmpty()) {
+					// Events with channel UUID: process in order per channel
+					ExecutorService channelExecutor = channelExecutors.computeIfAbsent(
+							channelUuid,
+							uuid -> {
+								log.debug("Creating executor for channel {}", uuid);
+								return Executors.newSingleThreadExecutor(Thread.ofVirtual().factory());
+							}
+					);
+
+					channelExecutor.execute(() -> {
+						try {
+							listener.onEslEvent(ctx, event);
+						} finally {
+							// Cleanup executor when channel is destroyed
+							if ("CHANNEL_DESTROY".equals(event.getEventName())) {
+								log.debug("Removing executor for channel {}", channelUuid);
+								ExecutorService executor = channelExecutors.remove(channelUuid);
+								if (executor != null) {
+									executor.shutdown();
+								}
+							}
+						}
+					});
+				} else {
+					// Events without channel UUID (HEARTBEAT, etc.): process concurrently
+					callbackExecutor.execute(() -> listener.onEslEvent(ctx, event));
+				}
 			}
 		}
 
