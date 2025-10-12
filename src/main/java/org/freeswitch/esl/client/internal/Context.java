@@ -1,32 +1,32 @@
 package org.freeswitch.esl.client.internal;
 
-import io.netty.channel.Channel;
 import org.freeswitch.esl.client.transport.CommandResponse;
 import org.freeswitch.esl.client.transport.SendMsg;
 import org.freeswitch.esl.client.transport.event.EslEvent;
 import org.freeswitch.esl.client.transport.message.EslMessage;
+import org.freeswitch.esl.client.transport.socket.SocketWrapper;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 
 import static com.google.common.base.Preconditions.*;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.base.Throwables.propagate;
-import static com.google.common.util.concurrent.Futures.getUnchecked;
 import static org.freeswitch.esl.client.internal.IModEslApi.EventFormat.*;
 
 public class Context implements IModEslApi {
 
 	private final AbstractEslClientHandler handler;
-	private final Channel channel;
+	private final SocketWrapper socket;
 
-	public Context(Channel channel, AbstractEslClientHandler clientHandler) {
+	public Context(SocketWrapper socket, AbstractEslClientHandler clientHandler) {
 		this.handler = clientHandler;
-		this.channel = channel;
+		this.socket = socket;
 	}
 
 	@Override
 	public boolean canSend() {
-		return channel != null && channel.isActive();
+		return socket != null && socket.isConnected();
 	}
 
 	/**
@@ -43,11 +43,9 @@ public class Context implements IModEslApi {
 		checkArgument(!isNullOrEmpty(command), "command cannot be null or empty");
 
 		try {
-
-			return getUnchecked(handler.sendApiSingleLineCommand(channel, command.toLowerCase().trim()));
-
-		} catch (Throwable t) {
-			throw propagate(t);
+			return handler.sendApiSingleLineCommand(socket, command.toLowerCase().trim()).get();
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
 		}
 	}
 
@@ -67,17 +65,15 @@ public class Context implements IModEslApi {
 		checkArgument(!isNullOrEmpty(command), "command cannot be null or empty");
 
 		try {
-
 			final StringBuilder sb = new StringBuilder();
 			sb.append("api ").append(command);
 			if (!isNullOrEmpty(arg)) {
 				sb.append(' ').append(arg);
 			}
 
-			return getUnchecked(handler.sendApiSingleLineCommand(channel, sb.toString()));
-
-		} catch (Throwable t) {
-			throw propagate(t);
+			return handler.sendApiSingleLineCommand(socket, sb.toString()).get();
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
 		}
 	}
 
@@ -103,7 +99,7 @@ public class Context implements IModEslApi {
 			sb.append(' ').append(arg);
 		}
 
-		return handler.sendBackgroundApiCommand(channel, sb.toString());
+		return handler.sendBackgroundApiCommand(socket, sb.toString());
 	}
 
 	/**
@@ -130,20 +126,17 @@ public class Context implements IModEslApi {
 		checkState(format.equals(PLAIN), "Only 'plain' event format is supported at present");
 
 		try {
-
 			final StringBuilder sb = new StringBuilder();
 			sb.append("event ").append(format.toString());
 			if (!isNullOrEmpty(events)) {
 				sb.append(' ').append(events);
 			}
 
-			final EslMessage response = getUnchecked(handler.sendApiSingleLineCommand(channel, sb.toString()));
+			final EslMessage response = handler.sendApiSingleLineCommand(socket, sb.toString()).get();
 			return new CommandResponse(sb.toString(), response);
-
-		} catch (Throwable t) {
-			throw propagate(t);
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
 		}
-
 	}
 
 	/**
@@ -155,10 +148,10 @@ public class Context implements IModEslApi {
 	public CommandResponse cancelEventSubscriptions() {
 
 		try {
-			final EslMessage response = getUnchecked(handler.sendApiSingleLineCommand(channel, "noevents"));
+			final EslMessage response = handler.sendApiSingleLineCommand(socket, "noevents").get();
 			return new CommandResponse("noevents", response);
-		} catch (Throwable t) {
-			throw propagate(t);
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
 		}
 	}
 
@@ -194,11 +187,10 @@ public class Context implements IModEslApi {
 				sb.append(' ').append(valueToFilter);
 			}
 
-			final EslMessage response = getUnchecked(handler.sendApiSingleLineCommand(channel, sb.toString()));
+			final EslMessage response = handler.sendApiSingleLineCommand(socket, sb.toString()).get();
 			return new CommandResponse(sb.toString(), response);
-
-		} catch (Throwable t) {
-			throw propagate(t);
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
 		}
 	}
 
@@ -215,18 +207,16 @@ public class Context implements IModEslApi {
 		checkArgument(!isNullOrEmpty(eventHeader), "eventHeader cannot be null or empty");
 
 		try {
-
 			final StringBuilder sb = new StringBuilder();
 			sb.append("filter delete ").append(eventHeader);
 			if (!isNullOrEmpty(valueToFilter)) {
 				sb.append(' ').append(valueToFilter);
 			}
 
-			final EslMessage response = getUnchecked(handler.sendApiSingleLineCommand(channel, sb.toString()));
+			final EslMessage response = handler.sendApiSingleLineCommand(socket, sb.toString()).get();
 			return new CommandResponse(sb.toString(), response);
-
-		} catch (Throwable t) {
-			throw propagate(t);
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
 		}
 	}
 
@@ -243,12 +233,11 @@ public class Context implements IModEslApi {
 		checkNotNull(sendMsg, "sendMsg cannot be null");
 
 		try {
-			final EslMessage response = getUnchecked(handler.sendApiMultiLineCommand(channel, sendMsg.getMsgLines()));
+			final EslMessage response = handler.sendApiMultiLineCommand(socket, sendMsg.getMsgLines()).get();
 			return new CommandResponse(sendMsg.toString(), response);
-		} catch (Throwable t) {
-			throw propagate(t);
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
 		}
-
 	}
 
 	/**
@@ -264,12 +253,11 @@ public class Context implements IModEslApi {
 			final StringBuilder sb = new StringBuilder();
 			sb.append("log ").append(level.toString());
 
-			final EslMessage response = getUnchecked(handler.sendApiSingleLineCommand(channel, sb.toString()));
+			final EslMessage response = handler.sendApiSingleLineCommand(socket, sb.toString()).get();
 			return new CommandResponse(sb.toString(), response);
-		} catch (Throwable t) {
-			throw propagate(t);
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
 		}
-
 	}
 
 	/**
@@ -281,19 +269,20 @@ public class Context implements IModEslApi {
 	public CommandResponse cancelLogging() {
 
 		try {
-			final EslMessage response = getUnchecked(handler.sendApiSingleLineCommand(channel, "nolog"));
+			final EslMessage response = handler.sendApiSingleLineCommand(socket, "nolog").get();
 			return new CommandResponse("nolog", response);
+		} catch (InterruptedException | ExecutionException e) {
+			throw propagate(e);
+		}
+	}
+
+	public void closeSocket() {
+		try {
+			if (socket != null && !socket.isClosed()) {
+				socket.close();
+			}
 		} catch (Throwable t) {
 			throw propagate(t);
 		}
 	}
-
-  public void closeChannel() {
-      try {
-          if(channel != null && channel.isOpen())
-              channel.close();
-      } catch (Throwable t) {
-          throw propagate(t);
-      }
-  }
 }

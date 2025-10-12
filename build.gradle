@@ -1,20 +1,29 @@
-apply plugin: 'java'
-apply plugin: 'maven'
+plugins {
+    id 'java'
+    id 'maven-publish'
+}
 
 group = 'org.freeswitch.esl.client'
 version = '0.10.0-SNAPSHOT'
 
-sourceCompatibility = 1.8
-targetCompatibility = 1.8
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
 
 repositories {
-     maven { url "http://repo.maven.apache.org/maven2" }
+    mavenCentral()
 }
 
 dependencies {
-    compile 'io.netty:netty-all:4.1.17.Final'
-    compile 'com.google.guava:guava:23.4-jre'
-    compile 'org.slf4j:slf4j-api:1.7.25'
-    runtime 'ch.qos.logback:logback-classic:1.2.3'
-    testCompile 'junit:junit:4.8.1'
+    implementation 'com.google.guava:guava:33.5.0-jre'
+    implementation 'org.slf4j:slf4j-api:2.0.17'
+    runtimeOnly 'ch.qos.logback:logback-classic:1.5.19'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.13.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
 }

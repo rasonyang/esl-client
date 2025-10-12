@@ -1,31 +1,31 @@
 /*
  * Copyright 2010 david varnes.
  *
- * Licensed under the Apache License, version 2.0 (the "License"); 
- * you may not use this file except in compliance with the License. 
+ * Licensed under the Apache License, version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at:
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, 
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
 package org.freeswitch.esl.client.inbound;
 
-import io.netty.channel.ChannelHandlerContext;
 import org.freeswitch.esl.client.internal.AbstractEslClientHandler;
 import org.freeswitch.esl.client.internal.Context;
 import org.freeswitch.esl.client.transport.CommandResponse;
 import org.freeswitch.esl.client.transport.event.EslEvent;
 import org.freeswitch.esl.client.transport.message.EslHeaders;
+import org.freeswitch.esl.client.transport.socket.SocketWrapper;
 
 /**
  * End users of the inbound {@link Client} should not need to use this class.
  * <p/>
- * Specialised {@link AbstractEslClientHandler} that implements the connection logic for an
+ * Specialized {@link AbstractEslClientHandler} that implements the connection logic for an
  * 'Inbound' FreeSWITCH Event Socket connection.  The responsibilities for this class are:
  * <ul><li>
  * To handle the auth request that the FreeSWITCH server will send immediately following a new
@@ -34,9 +34,7 @@ import org.freeswitch.esl.client.transport.message.EslHeaders;
  * To signal the observing {@link IEslProtocolListener} (expected to be the Inbound client
  * implementation) when ESL events are received.
  * </ul>
- * Note: implementation requirement is that an {@link ExecutionHandler} is placed in the processing
- * pipeline prior to this handler. This will ensure that each incoming message is processed in its
- * own thread (although still guaranteed to be processed in the order of receipt).
+ * All message processing is done in virtual threads for maximum scalability.
  */
 class InboundClientHandler extends AbstractEslClientHandler {
 
@@ -49,16 +47,16 @@ class InboundClientHandler extends AbstractEslClientHandler {
 	}
 
 	@Override
-	protected void handleEslEvent(ChannelHandlerContext ctx, EslEvent event) {
+	protected void handleEslEvent(SocketWrapper socket, EslEvent event) {
 		log.debug("Received event: [{}]", event);
-		listener.eventReceived(new Context(ctx.channel(), this), event);
+		listener.eventReceived(new Context(socket, this), event);
 	}
 
 	@Override
-	protected void handleAuthRequest(ChannelHandlerContext ctx) {
+	protected void handleAuthRequest(SocketWrapper socket) {
 		log.debug("Auth requested, sending [auth {}]", "*****");
 
-		sendApiSingleLineCommand(ctx.channel(), "auth " + password)
+		sendApiSingleLineCommand(socket, "auth " + password)
 				.thenAccept(response -> {
 					log.debug("Auth response [{}]", response);
 					if (response.getContentType().equals(EslHeaders.Value.COMMAND_REPLY)) {

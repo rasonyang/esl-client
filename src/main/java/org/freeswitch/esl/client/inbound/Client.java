@@ -16,19 +16,14 @@
 package org.freeswitch.esl.client.inbound;
 
 import com.google.common.base.Throwables;
-import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelOption;
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.nio.NioSocketChannel;
 import org.freeswitch.esl.client.internal.Context;
 import org.freeswitch.esl.client.internal.IModEslApi;
 import org.freeswitch.esl.client.transport.CommandResponse;
 import org.freeswitch.esl.client.transport.SendMsg;
 import org.freeswitch.esl.client.transport.event.EslEvent;
 import org.freeswitch.esl.client.transport.message.EslMessage;
+import org.freeswitch.esl.client.transport.socket.SocketFrameDecoder;
+import org.freeswitch.esl.client.transport.socket.SocketWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -58,7 +53,9 @@ public class Client implements IModEslApi {
 	private boolean authenticated;
 	private CommandResponse authenticationResponse;
 	private Optional<Context> clientContext = Optional.empty();
-	private ExecutorService callbackExecutor = Executors.newSingleThreadExecutor();
+	private Optional<SocketWrapper> socket = Optional.empty();
+	private Optional<Thread> messageReaderThread = Optional.empty();
+	private ExecutorService callbackExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
 	public void addEventListener(IEslEventListener listener) {
 		if (listener != null) {
@@ -100,54 +97,86 @@ public class Client implements IModEslApi {
 
 		log.info("Connecting to {} ...", clientAddress);
 
-		EventLoopGroup workerGroup = new NioEventLoopGroup();
+		try {
+			// Create socket connection with timeout
+			SocketWrapper socketWrapper = SocketWrapper.connect(clientAddress, timeoutSeconds * 1000);
+			this.socket = Optional.of(socketWrapper);
 
-		// Configure this client
-		Bootstrap bootstrap = new Bootstrap()
-				.group(workerGroup)
-				.channel(NioSocketChannel.class)
-				.option(ChannelOption.SO_KEEPALIVE, true);
+			log.info("Connected to {}", clientAddress);
 
-		// Add ESL handler and factory
-		InboundClientHandler handler = new InboundClientHandler(password, protocolListener);
-		bootstrap.handler(new InboundChannelInitializer(handler));
+			// Create handler
+			InboundClientHandler handler = new InboundClientHandler(password, protocolListener);
 
-		// Attempt connection
-		ChannelFuture future = bootstrap.connect(clientAddress);
+			// Create context
+			this.clientContext = Optional.of(new Context(socketWrapper, handler));
 
-		// Wait till attempt succeeds, fails or timeouts
-		if (!future.awaitUninterruptibly(timeoutSeconds, TimeUnit.SECONDS)) {
-			throw new InboundConnectionFailure("Timeout connecting to " + clientAddress);
-		}
-		// Did not timeout
-		final Channel channel = future.channel();
-		// But may have failed anyway
-		if (!future.isSuccess()) {
-			log.warn("Failed to connect to [{}]", clientAddress, future.cause());
+			// Start message reader thread (virtual thread)
+			Thread readerThread = Thread.startVirtualThread(() -> messageReaderLoop(socketWrapper, handler));
+			this.messageReaderThread = Optional.of(readerThread);
 
-			workerGroup.shutdownGracefully();
-
-			throw new InboundConnectionFailure("Could not connect to " + clientAddress, future.cause());
-		}
-
-		log.info("Connected to {}", clientAddress);
-
-		//  Wait for the authentication handshake to call back
-		while (!authenticatorResponded.get()) {
-			try {
-				Thread.sleep(250);
-			} catch (InterruptedException e) {
-				// ignore
+			// Wait for the authentication handshake to complete
+			long startTime = System.currentTimeMillis();
+			while (!authenticatorResponded.get()) {
+				if (System.currentTimeMillis() - startTime > timeoutSeconds * 1000L) {
+					throw new InboundConnectionFailure("Timeout waiting for authentication response");
+				}
+				try {
+					Thread.sleep(100);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new InboundConnectionFailure("Interrupted while waiting for authentication", e);
+				}
 			}
+
+			if (!authenticated) {
+				throw new InboundConnectionFailure("Authentication failed: " + authenticationResponse.getReplyText());
+			}
+
+			log.info("Authenticated");
+
+		} catch (Exception e) {
+			// Cleanup on failure
+			socket.ifPresent(s -> {
+				try {
+					s.close();
+				} catch (Exception ignored) {
+				}
+			});
+			socket = Optional.empty();
+			clientContext = Optional.empty();
+
+			if (e instanceof InboundConnectionFailure) {
+				throw (InboundConnectionFailure) e;
+			}
+			throw new InboundConnectionFailure("Failed to connect to " + clientAddress, e);
 		}
+	}
 
-		this.clientContext = Optional.of(new Context(channel, handler));
+	/**
+	 * Message reader loop - runs in a virtual thread.
+	 * Reads and processes ESL messages from the socket.
+	 */
+	private void messageReaderLoop(SocketWrapper socket, InboundClientHandler handler) {
+		SocketFrameDecoder decoder = new SocketFrameDecoder(8192);
 
-		if (!authenticated) {
-			throw new InboundConnectionFailure("Authentication failed: " + authenticationResponse.getReplyText());
+		try {
+			while (socket.isConnected() && !Thread.currentThread().isInterrupted()) {
+				try {
+					EslMessage message = decoder.decode(socket.getInputStream());
+					log.debug("Received message: {}", message.getContentType());
+
+					// Process message through handler
+					handler.processMessage(socket, message);
+
+				} catch (Exception e) {
+					log.error("Error reading/processing message", e);
+					handler.handleException(e);
+					break;
+				}
+			}
+		} finally {
+			log.info("Message reader thread exiting");
 		}
-
-		log.info("Authenticated");
 	}
 
 	/**
@@ -302,15 +331,34 @@ public class Client implements IModEslApi {
 
 		try {
 			if (clientContext.isPresent()) {
-				return new CommandResponse("exit", clientContext.get().sendCommand("exit"));
+				CommandResponse response = new CommandResponse("exit", clientContext.get().sendCommand("exit"));
+
+				// Interrupt reader thread
+				messageReaderThread.ifPresent(Thread::interrupt);
+
+				// Close socket
+				socket.ifPresent(s -> {
+					try {
+						s.close();
+					} catch (Exception e) {
+						log.warn("Error closing socket", e);
+					}
+				});
+
+				// Clear state
+				socket = Optional.empty();
+				clientContext = Optional.empty();
+				messageReaderThread = Optional.empty();
+				authenticated = false;
+				authenticatorResponded.set(false);
+
+				return response;
 			} else {
 				throw new IllegalStateException("not connected/authenticated");
 			}
 		} catch (Throwable t) {
 			throw Throwables.propagate(t);
 		}
-
-
 	}
 
 	/*

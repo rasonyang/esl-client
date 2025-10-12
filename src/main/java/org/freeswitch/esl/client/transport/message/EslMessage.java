@@ -120,17 +120,19 @@ public class EslMessage {
 	}
 
 	/**
-	 * Used by the {@link EslFrameDecoder}.
+	 * Used by frame decoders to add headers.
+	 * Public to allow access from socket package.
 	 */
-	void addHeader(Name name, String value) {
+	public void addHeader(Name name, String value) {
 		log.debug("adding header [{}] [{}]", name, value);
 		headers.put(name, value);
 	}
 
 	/**
-	 * Used by the {@link EslFrameDecoder}
+	 * Used by frame decoders to add body lines.
+	 * Public to allow access from socket package.
 	 */
-	void addBodyLine(String line) {
+	public void addBodyLine(String line) {
 		if (line == null) {
 			return;
 		}

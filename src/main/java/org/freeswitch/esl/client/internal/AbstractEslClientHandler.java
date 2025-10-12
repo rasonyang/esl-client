@@ -1,31 +1,30 @@
 /*
  * Copyright 2010 david varnes.
  *
- * Licensed under the Apache License, version 2.0 (the "License"); 
- * you may not use this file except in compliance with the License. 
+ * Licensed under the Apache License, version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at:
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, 
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
 package org.freeswitch.esl.client.internal;
 
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.SimpleChannelInboundHandler;
 import org.freeswitch.esl.client.transport.event.EslEvent;
 import org.freeswitch.esl.client.transport.event.EslEventHeaderNames;
 import org.freeswitch.esl.client.transport.message.EslHeaders.Name;
 import org.freeswitch.esl.client.transport.message.EslHeaders.Value;
 import org.freeswitch.esl.client.transport.message.EslMessage;
+import org.freeswitch.esl.client.transport.socket.SocketWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
@@ -34,58 +33,51 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Strings.isNullOrEmpty;
 
 /**
- * Specialised {@link SimpleChannelInboundHandler} that implements the logic of an ESL connection that
- * is common to both inbound and outbound clients. This
- * handler expects to receive decoded {@link EslMessage} or {@link EslEvent} objects. The key
- * responsibilities for this class are:
+ * Base handler that implements the logic of an ESL connection that is common to both inbound and
+ * outbound clients. This handler expects to receive decoded {@link EslMessage} or {@link EslEvent}
+ * objects. The key responsibilities for this class are:
  * <ul><li>
- * To synthesise a synchronous command/response api.  All IO operations using the underlying Netty
- * library are intrinsically asynchronous which provides for excellent response and scalability.  This
- * class provides for a blocking wait mechanism for responses to commands issued to the server.  A
- * key assumption here is that the FreeSWITCH server will process synchronous requests in the order they
- * are received.
+ * To synthesize a synchronous command/response API using CompletableFuture. This class provides
+ * for an asynchronous mechanism for responses to commands issued to the server. A key assumption
+ * here is that the FreeSWITCH server will process synchronous requests in the order they are received.
  * </li><li>
- * Concrete sub classes are expected to 'terminate' the Netty IO processing pipeline (ie be the 'last'
- * handler).
+ * All message processing is done in virtual threads for maximum scalability.
  * </li></ul>
- * Note: implementation requirement is that an {@link ExecutionHandler} is placed in the processing
- * pipeline prior to this handler. This will ensure that each incoming message is processed in its
- * own thread (although still guaranteed to be processed in the order of receipt).
  */
-public abstract class AbstractEslClientHandler extends SimpleChannelInboundHandler<EslMessage> {
+public abstract class AbstractEslClientHandler {
 
 	public static final String MESSAGE_TERMINATOR = "\n\n";
 	public static final String LINE_TERMINATOR = "\n";
 
 	protected final Logger log = LoggerFactory.getLogger(this.getClass());
-	// used to preserve association between adding future to queue and sending message on channel
+	// used to preserve association between adding future to queue and sending message on socket
 	private final ReentrantLock syncLock = new ReentrantLock();
 	private final ConcurrentLinkedQueue<CompletableFuture<EslMessage>> apiCalls =
 			new ConcurrentLinkedQueue<>();
 
 	private final ConcurrentHashMap<String, CompletableFuture<EslEvent>> backgroundJobs =
 			new ConcurrentHashMap<>();
-	private final ExecutorService backgroundJobExecutor = Executors.newCachedThreadPool();
+	private final ExecutorService backgroundJobExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
-	@Override
-	public void exceptionCaught(ChannelHandlerContext ctx, Throwable e) throws Exception {
+	/**
+	 * Handle exceptions during message processing
+	 */
+	public void handleException(Throwable e) {
+		log.error("Exception in ESL handler", e);
 
 		for (final CompletableFuture<EslMessage> apiCall : apiCalls) {
-			apiCall.completeExceptionally(e.getCause());
+			apiCall.completeExceptionally(e);
 		}
 
 		for (final CompletableFuture<EslEvent> backgroundJob : backgroundJobs.values()) {
-			backgroundJob.completeExceptionally(e.getCause());
+			backgroundJob.completeExceptionally(e);
 		}
-
-		ctx.close();
-
-		ctx.fireExceptionCaught(e);
-
 	}
 
-	@Override
-	protected void channelRead0(ChannelHandlerContext ctx, EslMessage message) throws Exception {
+	/**
+	 * Process an incoming ESL message
+	 */
+	public void processMessage(SocketWrapper socket, EslMessage message) {
 		final String contentType = message.getContentType();
 		if (contentType.equals(Value.TEXT_EVENT_PLAIN) ||
 				contentType.equals(Value.TEXT_EVENT_XML)) {
@@ -98,31 +90,37 @@ public abstract class AbstractEslClientHandler extends SimpleChannelInboundHandl
 					future.complete(eslEvent);
 				}
 			} else {
-				handleEslEvent(ctx, eslEvent);
+				handleEslEvent(socket, eslEvent);
 			}
 		} else {
-			handleEslMessage(ctx, message);
+			handleEslMessage(socket, message);
 		}
 	}
 
-	protected void handleEslMessage(ChannelHandlerContext ctx, EslMessage message) {
+	protected void handleEslMessage(SocketWrapper socket, EslMessage message) {
 		log.info("Received message: [{}]", message);
 		final String contentType = message.getContentType();
 
 		switch (contentType) {
 			case Value.API_RESPONSE:
 				log.debug("Api response received [{}]", message);
-				apiCalls.poll().complete(message);
+				CompletableFuture<EslMessage> apiCall = apiCalls.poll();
+				if (apiCall != null) {
+					apiCall.complete(message);
+				}
 				break;
 
 			case Value.COMMAND_REPLY:
 				log.debug("Command reply received [{}]", message);
-				apiCalls.poll().complete(message);
+				CompletableFuture<EslMessage> cmdCall = apiCalls.poll();
+				if (cmdCall != null) {
+					cmdCall.complete(message);
+				}
 				break;
 
 			case Value.AUTH_REQUEST:
 				log.debug("Auth request received [{}]", message);
-				handleAuthRequest(ctx);
+				handleAuthRequest(socket);
 				break;
 
 			case Value.TEXT_DISCONNECT_NOTICE:
@@ -137,56 +135,57 @@ public abstract class AbstractEslClientHandler extends SimpleChannelInboundHandl
 	}
 
 	/**
-	 * Synthesise a synchronous command/response by creating a callback object which is placed in
-	 * queue and blocks waiting for another IO thread to process an incoming {@link EslMessage} and
+	 * Synthesize a synchronous command/response by creating a callback object which is placed in
+	 * queue and waits for another thread to process an incoming {@link EslMessage} and
 	 * attach it to the callback.
 	 *
-	 * @param channel
+	 * @param socket  the socket wrapper
 	 * @param command single string to send
 	 * @return the {@link EslMessage} attached to this command's callback
 	 */
-	public CompletableFuture<EslMessage> sendApiSingleLineCommand(Channel channel, final String command) {
+	public CompletableFuture<EslMessage> sendApiSingleLineCommand(SocketWrapper socket, final String command) {
 		final CompletableFuture<EslMessage> future = new CompletableFuture<>();
 		try {
 			syncLock.lock();
 			apiCalls.add(future);
-			channel.writeAndFlush(command + MESSAGE_TERMINATOR);
+			socket.writeAndFlush(command + MESSAGE_TERMINATOR);
+		} catch (IOException e) {
+			apiCalls.poll();
+			future.completeExceptionally(e);
 		} finally {
 			syncLock.unlock();
 		}
 
 		return future;
-
 	}
 
 	/**
-	 * Sends a FreeSWITCH API command to the channel and blocks, waiting for an immediate response from the
-	 * server.
+	 * Sends a FreeSWITCH API command to the server and returns a future for the response.
 	 * <p/>
 	 * The outcome of the command from the server is returned in an {@link EslMessage} object.
 	 *
-	 * @param channel
+	 * @param socket  the socket wrapper
 	 * @param command API command to send
 	 * @param arg     command arguments
 	 * @return an {@link EslMessage} containing command results
 	 */
-	public CompletableFuture<EslMessage> sendSyncApiCommand(Channel channel, String command, String arg) {
+	public CompletableFuture<EslMessage> sendSyncApiCommand(SocketWrapper socket, String command, String arg) {
 
 		checkArgument(!isNullOrEmpty(command), "command may not be null or empty");
 		checkArgument(!isNullOrEmpty(arg), "arg may not be null or empty");
 
-		return sendApiSingleLineCommand(channel, "api " + command + ' ' + arg);
+		return sendApiSingleLineCommand(socket, "api " + command + ' ' + arg);
 	}
 
 	/**
-	 * Synthesise a synchronous command/response by creating a callback object which is placed in
-	 * queue and blocks waiting for another IO thread to process an incoming {@link EslMessage} and
+	 * Synthesize a synchronous command/response by creating a callback object which is placed in
+	 * queue and waits for another thread to process an incoming {@link EslMessage} and
 	 * attach it to the callback.
 	 *
-	 * @param channel
+	 * @param socket the socket wrapper
 	 * @return the {@link EslMessage} attached to this command's callback
 	 */
-	public CompletableFuture<EslMessage> sendApiMultiLineCommand(Channel channel, final List<String> commandLines) {
+	public CompletableFuture<EslMessage> sendApiMultiLineCommand(SocketWrapper socket, final List<String> commandLines) {
 		//  Build command with double line terminator at the end
 		final StringBuilder sb = new StringBuilder();
 		for (final String line : commandLines) {
@@ -199,26 +198,27 @@ public abstract class AbstractEslClientHandler extends SimpleChannelInboundHandl
 		try {
 			syncLock.lock();
 			apiCalls.add(future);
-			channel.write(sb.toString());
-            channel.flush();
+			socket.writeAndFlush(sb.toString());
+		} catch (IOException e) {
+			apiCalls.poll();
+			future.completeExceptionally(e);
 		} finally {
 			syncLock.unlock();
 		}
 
 		return future;
-
 	}
 
 	/**
 	 * Returns the Job UUID of that the response event will have.
 	 *
-	 * @param channel
-	 * @param command
+	 * @param socket  the socket wrapper
+	 * @param command the command to send
 	 * @return Job-UUID as a string
 	 */
-	public CompletableFuture<EslEvent> sendBackgroundApiCommand(Channel channel, final String command) {
+	public CompletableFuture<EslEvent> sendBackgroundApiCommand(SocketWrapper socket, final String command) {
 
-		return sendApiSingleLineCommand(channel, command)
+		return sendApiSingleLineCommand(socket, command)
 				.thenComposeAsync(result -> {
 					if (result.hasHeader(Name.JOB_UUID)) {
 						final String jobId = result.getHeaderValue(Name.JOB_UUID);
@@ -233,9 +233,9 @@ public abstract class AbstractEslClientHandler extends SimpleChannelInboundHandl
 				}, backgroundJobExecutor);
 	}
 
-	protected abstract void handleEslEvent(ChannelHandlerContext ctx, EslEvent event);
+	protected abstract void handleEslEvent(SocketWrapper socket, EslEvent event);
 
-	protected abstract void handleAuthRequest(ChannelHandlerContext ctx);
+	protected abstract void handleAuthRequest(SocketWrapper socket);
 
 	protected abstract void handleDisconnectionNotice();
 
