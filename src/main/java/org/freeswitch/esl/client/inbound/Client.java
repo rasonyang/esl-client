@@ -28,8 +28,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.SocketAddress;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -44,8 +47,25 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class Client implements IModEslApi {
 
+	/**
+	 * Internal wrapper for event listeners with optional Event-Name filtering.
+	 */
+	private static class FilteredListener {
+		final IEslEventListener listener;
+		final Set<String> eventNames; // null = all events
+
+		FilteredListener(IEslEventListener listener, Set<String> eventNames) {
+			this.listener = listener;
+			this.eventNames = eventNames;
+		}
+
+		boolean matches(String eventName) {
+			return eventNames == null || eventNames.contains(eventName);
+		}
+	}
+
 	private final Logger log = LoggerFactory.getLogger(this.getClass());
-	private final List<IEslEventListener> eventListeners = new CopyOnWriteArrayList<>();
+	private final List<FilteredListener> eventListeners = new CopyOnWriteArrayList<>();
 	private final AtomicBoolean authenticatorResponded = new AtomicBoolean(false);
 	private final ConcurrentHashMap<String, CompletableFuture<EslEvent>> backgroundJobs =
 			new ConcurrentHashMap<>();
@@ -62,10 +82,51 @@ public class Client implements IModEslApi {
 	// Executor for events without channel UUID (e.g., HEARTBEAT, system events)
 	private ExecutorService callbackExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
+	// Auto-update server subscription based on listener filters
+	private boolean autoUpdateServerSubscription = false;
+	private String lastServerSubscription = null;
+
+	/**
+	 * Add a global event listener that receives all events.
+	 *
+	 * @param listener the event listener to add
+	 */
 	public void addEventListener(IEslEventListener listener) {
 		if (listener != null) {
-			eventListeners.add(listener);
+			eventListeners.add(new FilteredListener(listener, null));
+			updateServerSubscriptions();
 		}
+	}
+
+	/**
+	 * Add an event listener that only receives specific event types (filtered by Event-Name).
+	 *
+	 * @param listener the event listener to add
+	 * @param eventNames the event names to filter (e.g., "CHANNEL_CREATE", "CHANNEL_HANGUP")
+	 */
+	public void addEventListener(IEslEventListener listener, String... eventNames) {
+		if (listener != null && eventNames != null && eventNames.length > 0) {
+			Set<String> eventNameSet = new HashSet<>(Arrays.asList(eventNames));
+			eventListeners.add(new FilteredListener(listener, eventNameSet));
+			updateServerSubscriptions();
+		}
+	}
+
+	/**
+	 * Remove an event listener.
+	 *
+	 * @param listener the event listener to remove
+	 * @return true if the listener was found and removed
+	 */
+	public boolean removeEventListener(IEslEventListener listener) {
+		if (listener == null) {
+			return false;
+		}
+		boolean removed = eventListeners.removeIf(fl -> fl.listener == listener);
+		if (removed) {
+			updateServerSubscriptions();
+		}
+		return removed;
 	}
 
 	@Override
@@ -83,6 +144,21 @@ public class Client implements IModEslApi {
 
 	public void setCallbackExecutor(ExecutorService callbackExecutor) {
 		this.callbackExecutor = callbackExecutor;
+	}
+
+	/**
+	 * Enable or disable automatic server-side event subscription optimization.
+	 * When enabled, the client will automatically calculate the union of all listener event filters
+	 * and update the server subscription accordingly to minimize network traffic.
+	 *
+	 * @param enable true to enable auto-update, false to disable (default: false)
+	 */
+	public void setAutoUpdateServerSubscription(boolean enable) {
+		this.autoUpdateServerSubscription = enable;
+		if (enable && canSend()) {
+			// Immediately update if already connected
+			updateServerSubscriptions();
+		}
 	}
 
 	/**
@@ -327,6 +403,54 @@ public class Client implements IModEslApi {
 	}
 
 	/**
+	 * Automatically update server-side event subscriptions based on all listener filters.
+	 * This method is called automatically when auto-update is enabled and listeners are added/removed.
+	 */
+	private void updateServerSubscriptions() {
+		// Only update if feature is enabled and connected
+		if (!autoUpdateServerSubscription || !canSend()) {
+			return;
+		}
+
+		// Calculate required subscription
+		String newSubscription;
+		boolean hasGlobalListener = false;
+		Set<String> allEventTypes = new HashSet<>();
+
+		for (FilteredListener fl : eventListeners) {
+			if (fl.eventNames == null) {
+				// Global listener found - need to subscribe to all events
+				hasGlobalListener = true;
+				break;
+			}
+			allEventTypes.addAll(fl.eventNames);
+		}
+
+		if (hasGlobalListener || allEventTypes.isEmpty()) {
+			// Subscribe to all events
+			newSubscription = "all";
+		} else {
+			// Subscribe to specific event types (sorted for consistent comparison)
+			newSubscription = String.join(" ", allEventTypes.stream().sorted().toList());
+		}
+
+		// Only update if subscription changed
+		if (newSubscription.equals(lastServerSubscription)) {
+			log.debug("Server subscription unchanged: {}", newSubscription);
+			return;
+		}
+
+		// Update server subscription
+		try {
+			log.info("Auto-updating server subscription to: {}", newSubscription);
+			setEventSubscriptions(EventFormat.PLAIN, newSubscription);
+			lastServerSubscription = newSubscription;
+		} catch (Exception e) {
+			log.error("Failed to auto-update server subscription", e);
+		}
+	}
+
+	/**
 	 * Close the socket connection
 	 *
 	 * @return a {@link CommandResponse} with the server's response.
@@ -387,10 +511,17 @@ public class Client implements IModEslApi {
 		public void eventReceived(final Context ctx, final EslEvent event) {
 			log.debug("Event received [{}]", event);
 
-			// Get channel UUID from event headers
+			// Get channel UUID and event name from event headers
 			String channelUuid = event.getEventHeaders().get("Unique-ID");
+			String eventName = event.getEventName();
 
-			for (final IEslEventListener listener : eventListeners) {
+			for (final FilteredListener fl : eventListeners) {
+				// Check if this listener is interested in this event type
+				if (!fl.matches(eventName)) {
+					continue;
+				}
+
+				final IEslEventListener listener = fl.listener;
 				if (channelUuid != null && !channelUuid.isEmpty()) {
 					// Events with channel UUID: process in order per channel
 					ExecutorService channelExecutor = channelExecutors.computeIfAbsent(
@@ -406,7 +537,7 @@ public class Client implements IModEslApi {
 							listener.onEslEvent(ctx, event);
 						} finally {
 							// Cleanup executor when channel is destroyed
-							if ("CHANNEL_DESTROY".equals(event.getEventName())) {
+							if ("CHANNEL_DESTROY".equals(eventName)) {
 								log.debug("Removing executor for channel {}", channelUuid);
 								ExecutorService executor = channelExecutors.remove(channelUuid);
 								if (executor != null) {
