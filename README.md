@@ -218,9 +218,8 @@ Contributions are welcome! Please feel free to submit pull requests.
 
 ## Additional Resources
 
-- [FreeSWITCH Event Socket Documentation](https://freeswitch.org/confluence/display/FREESWITCH/Event+Socket)
-- [Java 21 Virtual Threads Guide](https://openjdk.org/jeps/444)
-- [Project Loom](https://openjdk.org/projects/loom/)
+- [FreeSWITCH Event Socket Documentation](https://developer.signalwire.com/freeswitch/FreeSWITCH-Explained/Client-and-Developer-Interfaces/Event-Socket-Library/)
+- [Java 21 Virtual Threads Guide](https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html)
 
 ---
 
