@@ -138,6 +138,7 @@ public class SocketClient {
 	 */
 	private void handleClient(Socket clientSocket) {
 		SocketWrapper socket = null;
+		OutboundClientHandler handler = null;
 		try {
 			// Configure socket
 			clientSocket.setTcpNoDelay(true);
@@ -146,7 +147,7 @@ public class SocketClient {
 			socket = new SocketWrapper(clientSocket);
 
 			// Create handler for this connection
-			OutboundClientHandler handler = new OutboundClientHandler(
+			handler = new OutboundClientHandler(
 					clientHandlerFactory.createClientHandler(),
 					callbackExecutor);
 
@@ -178,7 +179,12 @@ public class SocketClient {
 		} catch (Exception e) {
 			log.error("Error handling client connection", e);
 		} finally {
-			// Cleanup
+			// Cleanup handler resources
+			if (handler != null) {
+				handler.shutdown();
+			}
+
+			// Cleanup socket
 			if (socket != null) {
 				try {
 					socket.close();

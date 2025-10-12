@@ -127,27 +127,47 @@ gradle clean build
 
 ## Virtual Threads Architecture
 
-This library makes extensive use of Java 21 Virtual Threads:
+This library makes extensive use of Java 21 Virtual Threads with **guaranteed event ordering**:
 
-### Message Processing
-Each connection spawns a virtual thread that continuously reads and processes ESL messages:
+### Inbound Mode (Client)
+
+**Message Processing**:
+- 1 virtual thread per connection for reading ESL messages
+
+**Event Processing with Ordering**:
+- Each Channel UUID gets its own single-threaded virtual thread executor
+- Events for the same channel are processed **sequentially** (preserves order)
+- Different channels process **concurrently** (maximum throughput)
+- Events without Channel UUID (HEARTBEAT, etc.) use shared thread pool
 
 ```java
-Thread readerThread = Thread.startVirtualThread(() -> messageReaderLoop(socket, handler));
+// Per-channel executor ensures sequential processing
+ExecutorService channelExecutor = channelExecutors.computeIfAbsent(
+    channelUuid,
+    uuid -> Executors.newSingleThreadExecutor(Thread.ofVirtual().factory())
+);
 ```
 
-### Event Callbacks
-All event listeners execute in a virtual thread pool:
-
-```java
-ExecutorService callbackExecutor = Executors.newVirtualThreadPerTaskExecutor();
+**Critical**: This ensures channel state transitions maintain correct order:
+```
+CHANNEL_CREATE → CHANNEL_ANSWER → CHANNEL_EXECUTE → CHANNEL_HANGUP
 ```
 
-### Outbound Connections
-Each incoming FreeSWITCH connection is handled in its own virtual thread:
+### Outbound Mode (Server)
+
+**Connection Handling**:
+- 1 virtual thread for accepting connections
+- 1 virtual thread per FreeSWITCH connection for reading messages
+
+**Event Processing with Ordering**:
+- Each connection gets its own single-threaded virtual thread executor
+- Events are processed **sequentially** to preserve order
+- Virtual thread overhead is minimal (~1KB per thread)
 
 ```java
-Thread.startVirtualThread(() -> handleClient(clientSocket));
+// Single-threaded executor per connection ensures event ordering
+private final ExecutorService eventExecutor =
+    Executors.newSingleThreadExecutor(Thread.ofVirtual().factory());
 ```
 
 ## Performance Benefits

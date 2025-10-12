@@ -22,6 +22,7 @@ import org.freeswitch.esl.client.transport.message.EslMessage;
 import org.freeswitch.esl.client.transport.socket.SocketWrapper;
 
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Specialized {@link AbstractEslClientHandler} that implements the base connection logic for an
@@ -36,11 +37,13 @@ import java.util.concurrent.ExecutorService;
 class OutboundClientHandler extends AbstractEslClientHandler {
 
 	private final IClientHandler clientHandler;
-	private final ExecutorService callbackExecutor;
+	// Single-threaded virtual thread executor for this connection to ensure event ordering
+	private final ExecutorService eventExecutor;
 
 	public OutboundClientHandler(IClientHandler clientHandler, ExecutorService callbackExecutor) {
 		this.clientHandler = clientHandler;
-		this.callbackExecutor = callbackExecutor;
+		// Each outbound connection gets its own single-threaded executor to preserve event order
+		this.eventExecutor = Executors.newSingleThreadExecutor(Thread.ofVirtual().factory());
 	}
 
 	/**
@@ -67,7 +70,8 @@ class OutboundClientHandler extends AbstractEslClientHandler {
 
 	@Override
 	protected void handleEslEvent(final SocketWrapper socket, final EslEvent event) {
-		callbackExecutor.execute(() -> clientHandler.onEslEvent(
+		// Use single-threaded executor to ensure events are processed in order
+		eventExecutor.execute(() -> clientHandler.onEslEvent(
 				new Context(socket, OutboundClientHandler.this), event));
 	}
 
@@ -80,5 +84,14 @@ class OutboundClientHandler extends AbstractEslClientHandler {
 	@Override
 	protected void handleDisconnectionNotice() {
 		log.debug("Received disconnection notice");
+	}
+
+	/**
+	 * Shutdown the event executor to release resources.
+	 * Should be called when the connection is closed.
+	 */
+	public void shutdown() {
+		log.debug("Shutting down event executor");
+		eventExecutor.shutdown();
 	}
 }
