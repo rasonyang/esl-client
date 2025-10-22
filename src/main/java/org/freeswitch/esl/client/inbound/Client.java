@@ -43,6 +43,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * to the Event Socket module. That is, with reference to the socket listening on the FreeSWITCH
  * server, this client occurs as an inbound connection to the server.
  * <p/>
+ * By default, this client includes automatic reconnection capability:
+ * - Monitors HEARTBEAT events from FreeSWITCH
+ * - Automatically reconnects on connection failure
+ * - Preserves listeners and subscriptions across reconnections
+ * <p/>
+ * Reconnection can be disabled via {@link #setReconnectable(boolean)} or customized via
+ * {@link #setReconnectionConfig(ReconnectionConfig)}.
+ * <p/>
  * See <a href="http://wiki.freeswitch.org/wiki/Mod_event_socket">http://wiki.freeswitch.org/wiki/Mod_event_socket</a>
  */
 public class Client implements IModEslApi {
@@ -85,6 +93,24 @@ public class Client implements IModEslApi {
 	// Auto-update server subscription based on listener filters
 	private boolean autoUpdateServerSubscription = false;
 	private String lastServerSubscription = null;
+
+	// Reconnection support (enabled by default)
+	private boolean reconnectable = true;
+	private ReconnectionConfig reconnectionConfig = new ReconnectionConfig();
+	private HeartbeatMonitor heartbeatMonitor;
+	private ExponentialBackoffStrategy reconnectStrategy;
+	private ScheduledExecutorService healthCheckExecutor;
+	private ScheduledFuture<?> healthCheckTask;
+	private final AtomicBoolean reconnecting = new AtomicBoolean(false);
+	private final AtomicBoolean connected = new AtomicBoolean(false);
+	private volatile boolean running = true;
+
+	// Connection parameters (saved for reconnection)
+	private SocketAddress address;
+	private String password;
+	private int timeoutSeconds;
+	private volatile String eventSubscription;
+	private volatile EventFormat eventFormat;
 
 	/**
 	 * Add a global event listener that receives all events.
@@ -162,28 +188,106 @@ public class Client implements IModEslApi {
 	}
 
 	/**
+	 * Enable or disable automatic reconnection.
+	 * Must be called before {@link #connect(SocketAddress, String, int)}.
+	 *
+	 * @param reconnectable true to enable reconnection (default), false to disable
+	 * @throws IllegalStateException if already connected
+	 */
+	public void setReconnectable(boolean reconnectable) {
+		if (connected.get()) {
+			throw new IllegalStateException("Cannot change reconnectable setting while connected. Call before connect().");
+		}
+		this.reconnectable = reconnectable;
+		log.info("Reconnection {}", reconnectable ? "enabled" : "disabled");
+	}
+
+	/**
+	 * Set custom reconnection configuration.
+	 * Passing null disables reconnection.
+	 * Must be called before {@link #connect(SocketAddress, String, int)}.
+	 *
+	 * @param config reconnection configuration, or null to disable reconnection
+	 * @throws IllegalStateException if already connected
+	 */
+	public void setReconnectionConfig(ReconnectionConfig config) {
+		if (connected.get()) {
+			throw new IllegalStateException("Cannot change reconnection config while connected. Call before connect().");
+		}
+		if (config == null) {
+			this.reconnectable = false;
+			log.info("Reconnection disabled (config = null)");
+		} else {
+			this.reconnectable = true;
+			this.reconnectionConfig = config;
+			log.info("Reconnection enabled with custom config: {}", config);
+		}
+	}
+
+	/**
+	 * Check if reconnection is enabled.
+	 *
+	 * @return true if automatic reconnection is enabled
+	 */
+	public boolean isReconnectable() {
+		return reconnectable;
+	}
+
+	/**
+	 * Check if currently reconnecting.
+	 *
+	 * @return true if reconnection is in progress
+	 */
+	public boolean isReconnecting() {
+		return reconnecting.get();
+	}
+
+	/**
 	 * Attempt to establish an authenticated connection to the nominated FreeSWITCH ESL server socket.
 	 * This call will block, waiting for an authentication handshake to occur, or timeout after the
 	 * supplied number of seconds.
+	 * <p/>
+	 * If reconnection is enabled (default), the client will automatically monitor HEARTBEAT events
+	 * and reconnect on connection failure.
 	 *
 	 * @param clientAddress  a SocketAddress representing the endpoint to connect to
 	 * @param password       server event socket is expecting (set in event_socket_conf.xml)
 	 * @param timeoutSeconds number of seconds to wait for the server socket before aborting
 	 */
 	public void connect(SocketAddress clientAddress, String password, int timeoutSeconds) throws InboundConnectionFailure {
+		// Save connection parameters for reconnection
+		this.address = clientAddress;
+		this.password = password;
+		this.timeoutSeconds = timeoutSeconds;
+
+		// Perform initial connection
+		doConnect();
+
+		// Initialize and start reconnection monitoring if enabled
+		if (reconnectable) {
+			initializeReconnection();
+			startHealthCheck();
+			log.info("Automatic reconnection enabled");
+		}
+	}
+
+	/**
+	 * Internal method to perform connection.
+	 */
+	private void doConnect() throws InboundConnectionFailure {
 		// If already connected, disconnect first
 		if (canSend()) {
 			close();
 		}
 
-		log.info("Connecting to {} ...", clientAddress);
+		log.info("Connecting to {} ...", address);
 
 		try {
 			// Create socket connection with timeout
-			SocketWrapper socketWrapper = SocketWrapper.connect(clientAddress, timeoutSeconds * 1000);
+			SocketWrapper socketWrapper = SocketWrapper.connect(address, timeoutSeconds * 1000);
 			this.socket = Optional.of(socketWrapper);
 
-			log.info("Connected to {}", clientAddress);
+			log.info("Connected to {}", address);
 
 			// Create handler
 			InboundClientHandler handler = new InboundClientHandler(password, protocolListener);
@@ -215,6 +319,22 @@ public class Client implements IModEslApi {
 
 			log.info("Authenticated");
 
+			// Restore event subscriptions if reconnecting
+			if (reconnectable && eventSubscription != null) {
+				String fullSubscription = eventSubscription + " HEARTBEAT";
+				setEventSubscriptions(eventFormat != null ? eventFormat : EventFormat.PLAIN, fullSubscription);
+			} else if (reconnectable) {
+				// First connection - subscribe to HEARTBEAT for monitoring
+				setEventSubscriptions(EventFormat.PLAIN, "HEARTBEAT");
+			}
+
+			// Reset heartbeat monitor if enabled
+			if (reconnectable && heartbeatMonitor != null) {
+				heartbeatMonitor.reset();
+			}
+
+			connected.set(true);
+
 		} catch (Exception e) {
 			// Cleanup on failure
 			socket.ifPresent(s -> {
@@ -229,8 +349,120 @@ public class Client implements IModEslApi {
 			if (e instanceof InboundConnectionFailure) {
 				throw (InboundConnectionFailure) e;
 			}
-			throw new InboundConnectionFailure("Failed to connect to " + clientAddress, e);
+			throw new InboundConnectionFailure("Failed to connect to " + address, e);
 		}
+	}
+
+	/**
+	 * Initialize reconnection components.
+	 */
+	private void initializeReconnection() {
+		if (heartbeatMonitor == null) {
+			heartbeatMonitor = new HeartbeatMonitor(reconnectionConfig.getHeartbeatTimeoutMs());
+		}
+		if (reconnectStrategy == null) {
+			reconnectStrategy = ExponentialBackoffStrategy.fromConfig(reconnectionConfig);
+		}
+		if (healthCheckExecutor == null) {
+			healthCheckExecutor = Executors.newSingleThreadScheduledExecutor(
+					Thread.ofVirtual().name("health-check").factory()
+			);
+		}
+	}
+
+	/**
+	 * Start health check task.
+	 */
+	private void startHealthCheck() {
+		if (healthCheckTask != null && !healthCheckTask.isDone()) {
+			healthCheckTask.cancel(false);
+		}
+
+		healthCheckTask = healthCheckExecutor.scheduleWithFixedDelay(
+				this::performHealthCheck,
+				reconnectionConfig.getHealthCheckIntervalMs(),
+				reconnectionConfig.getHealthCheckIntervalMs(),
+				TimeUnit.MILLISECONDS
+		);
+
+		log.debug("Health check started with interval: {}ms", reconnectionConfig.getHealthCheckIntervalMs());
+	}
+
+	/**
+	 * Perform health check and trigger reconnection if needed.
+	 */
+	private void performHealthCheck() {
+		try {
+			if (!running) {
+				return;
+			}
+
+			if (heartbeatMonitor.isTimeout() && connected.get() && !reconnecting.get()) {
+				log.warn("Heartbeat timeout detected after {}ms, triggering reconnection",
+						heartbeatMonitor.getTimeSinceLastHeartbeat());
+				connected.set(false);
+				reconnect();
+			}
+		} catch (Exception e) {
+			log.error("Error during health check", e);
+		}
+	}
+
+	/**
+	 * Perform reconnection with exponential backoff.
+	 */
+	private void reconnect() {
+		if (!reconnecting.compareAndSet(false, true)) {
+			log.debug("Reconnection already in progress, skipping");
+			return;
+		}
+
+		log.info("Starting reconnection process");
+
+		Thread.startVirtualThread(() -> {
+			while (running && reconnecting.get()) {
+				try {
+					// Clean up old connection
+					try {
+						if (clientContext.isPresent()) {
+							socket.ifPresent(s -> {
+								try {
+									s.close();
+								} catch (Exception e) {
+									log.debug("Error closing old socket", e);
+								}
+							});
+						}
+					} catch (Exception e) {
+						log.debug("Error closing old connection", e);
+					}
+
+					// Calculate delay with exponential backoff
+					long delay = reconnectStrategy.nextDelay();
+					log.info("Waiting {}ms before reconnection attempt {} ...",
+							delay, reconnectStrategy.getAttemptCount());
+					Thread.sleep(delay);
+
+					// Attempt reconnection
+					doConnect();
+
+					// Success
+					log.info("Reconnection successful after {} attempts", reconnectStrategy.getAttemptCount());
+					reconnectStrategy.reset();
+					reconnecting.set(false);
+
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					log.warn("Reconnection interrupted");
+					reconnecting.set(false);
+					break;
+				} catch (Exception e) {
+					log.error("Reconnection attempt {} failed: {}",
+							reconnectStrategy.getAttemptCount(), e.getMessage());
+					// Continue loop to retry
+				}
+			}
+		});
 	}
 
 	/**
@@ -305,6 +537,9 @@ public class Client implements IModEslApi {
 	 * Subsequent calls to this method replaces any previous subscriptions that were set.
 	 * </p>
 	 * Note: current implementation can only process 'plain' events.
+	 * <p/>
+	 * If reconnection is enabled, HEARTBEAT events will be automatically added to the subscription
+	 * and the subscription will be preserved across reconnections.
 	 *
 	 * @param format can be { plain | xml }
 	 * @param events { all | space separated list of events }
@@ -313,7 +548,20 @@ public class Client implements IModEslApi {
 	@Override
 	public CommandResponse setEventSubscriptions(EventFormat format, String events) {
 		checkConnected();
-		return clientContext.get().setEventSubscriptions(format, events);
+
+		// Save subscription for reconnection
+		if (reconnectable) {
+			// Remove HEARTBEAT if user explicitly added it (we'll add it automatically)
+			String cleanEvents = events.replaceAll("\\bHEARTBEAT\\b", "").trim().replaceAll("\\s+", " ");
+			this.eventSubscription = cleanEvents.isEmpty() ? null : cleanEvents;
+			this.eventFormat = format;
+
+			// Add HEARTBEAT to actual subscription
+			String actualEvents = cleanEvents.isEmpty() ? "HEARTBEAT" : cleanEvents + " HEARTBEAT";
+			return clientContext.get().setEventSubscriptions(format, actualEvents);
+		} else {
+			return clientContext.get().setEventSubscriptions(format, events);
+		}
 	}
 
 	/**
@@ -451,7 +699,7 @@ public class Client implements IModEslApi {
 	}
 
 	/**
-	 * Close the socket connection
+	 * Close the socket connection and stop all background tasks.
 	 *
 	 * @return a {@link CommandResponse} with the server's response.
 	 */
@@ -459,6 +707,29 @@ public class Client implements IModEslApi {
 		checkConnected();
 
 		try {
+			// Stop reconnection
+			running = false;
+			reconnecting.set(false);
+			connected.set(false);
+
+			// Stop health check
+			if (healthCheckTask != null) {
+				healthCheckTask.cancel(false);
+			}
+
+			// Shutdown health check executor
+			if (healthCheckExecutor != null) {
+				healthCheckExecutor.shutdown();
+				try {
+					if (!healthCheckExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+						healthCheckExecutor.shutdownNow();
+					}
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					healthCheckExecutor.shutdownNow();
+				}
+			}
+
 			if (clientContext.isPresent()) {
 				CommandResponse response = new CommandResponse("exit", clientContext.get().sendCommand("exit"));
 
@@ -484,6 +755,8 @@ public class Client implements IModEslApi {
 				// Shutdown all channel executors
 				channelExecutors.values().forEach(ExecutorService::shutdown);
 				channelExecutors.clear();
+
+				log.info("Client closed");
 
 				return response;
 			} else {
@@ -514,6 +787,12 @@ public class Client implements IModEslApi {
 			// Get channel UUID and event name from event headers
 			String channelUuid = event.getEventHeaders().get("Unique-ID");
 			String eventName = event.getEventName();
+
+			// Handle HEARTBEAT for reconnection monitoring (if enabled)
+			if (reconnectable && "HEARTBEAT".equals(eventName) && heartbeatMonitor != null) {
+				heartbeatMonitor.recordHeartbeat();
+				log.trace("Heartbeat received and recorded");
+			}
 
 			for (final FilteredListener fl : eventListeners) {
 				// Check if this listener is interested in this event type

@@ -33,6 +33,8 @@ import java.util.concurrent.Executors;
  * transformed into an {@link EslEvent} that sub classes can handle.
  * </ul>
  * All message processing is done in virtual threads for maximum scalability.
+ * Each outbound connection gets its own single-threaded virtual thread executor to ensure
+ * all callbacks (onConnect and onEslEvent) are processed sequentially in order.
  */
 class OutboundClientHandler extends AbstractEslClientHandler {
 
@@ -55,9 +57,32 @@ class OutboundClientHandler extends AbstractEslClientHandler {
 		log.debug("Received new connection from server, sending connect message");
 
 		sendApiSingleLineCommand(socket, "connect")
-				.thenAccept(response -> clientHandler.onConnect(
-						new Context(socket, OutboundClientHandler.this),
-						new EslEvent(response, true)))
+				.thenAccept(response -> {
+					log.info("Connection established, subscribing to events");
+
+					// Subscribe to events for this channel only using 'myevents'
+					// In outbound mode, 'myevents' automatically filters events to the current channel
+					sendApiSingleLineCommand(socket, "myevents")
+							.thenAccept(eventResponse -> {
+								log.info("Event subscription confirmed: {}",
+									eventResponse.getHeaderValue(org.freeswitch.esl.client.transport.message.EslHeaders.Name.REPLY_TEXT));
+
+								// Notify client handler after subscription confirmed
+								// Run in eventExecutor to ensure single-threaded processing per channel
+								eventExecutor.execute(() -> clientHandler.onConnect(
+										new Context(socket, OutboundClientHandler.this),
+										new EslEvent(response, true)));
+							})
+							.exceptionally(throwable -> {
+								log.error("Failed to subscribe to events", throwable);
+								// Still notify handler even if subscription failed
+								// Run in eventExecutor to ensure single-threaded processing per channel
+								eventExecutor.execute(() -> clientHandler.onConnect(
+										new Context(socket, OutboundClientHandler.this),
+										new EslEvent(response, true)));
+								return null;
+							});
+				})
 				.exceptionally(throwable -> {
 					try {
 						socket.close();

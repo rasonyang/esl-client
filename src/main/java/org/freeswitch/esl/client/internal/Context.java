@@ -241,6 +241,19 @@ public class Context implements IModEslApi {
 	}
 
 	/**
+	 * Send a message asynchronously without waiting for response.
+	 * Use this for outbound async mode where sendmsg commands don't return replies.
+	 *
+	 * @param sendMsg a {@link SendMsg} command to send
+	 */
+	public void sendMessageAsync(SendMsg sendMsg) {
+		checkNotNull(sendMsg, "sendMsg cannot be null");
+
+		// Send the message without adding to apiCalls queue (no response expected in async mode)
+		handler.sendCommandWithoutResponse(socket, sendMsg.getMsgLines());
+	}
+
+	/**
 	 * Enable log output.
 	 *
 	 * @param level using the same values as in console.conf

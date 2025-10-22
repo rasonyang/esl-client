@@ -79,10 +79,14 @@ public abstract class AbstractEslClientHandler {
 	 */
 	public void processMessage(SocketWrapper socket, EslMessage message) {
 		final String contentType = message.getContentType();
+		log.info("[PROCESS] Processing message with content-type: {}", contentType);
+
 		if (contentType.equals(Value.TEXT_EVENT_PLAIN) ||
 				contentType.equals(Value.TEXT_EVENT_XML)) {
 			//  transform into an event
 			final EslEvent eslEvent = new EslEvent(message);
+			log.info("[PROCESS] Event received: {}", eslEvent.getEventName());
+
 			if (eslEvent.getEventName().equals("BACKGROUND_JOB")) {
 				final String backgroundUuid = eslEvent.getEventHeaders().get(EslEventHeaderNames.JOB_UUID);
 				final CompletableFuture<EslEvent> future = backgroundJobs.remove(backgroundUuid);
@@ -90,46 +94,56 @@ public abstract class AbstractEslClientHandler {
 					future.complete(eslEvent);
 				}
 			} else {
+				log.info("[PROCESS] Routing event to handleEslEvent: {}", eslEvent.getEventName());
 				handleEslEvent(socket, eslEvent);
 			}
 		} else {
+			log.info("[PROCESS] Routing message to handleEslMessage");
 			handleEslMessage(socket, message);
 		}
 	}
 
 	protected void handleEslMessage(SocketWrapper socket, EslMessage message) {
-		log.info("Received message: [{}]", message);
+		log.info("[RECV] Received message with content-type: [{}]", message.getContentType());
+		log.info("[RECV] Message details: {}", message);
+		log.info("[RECV] Current apiCalls queue size: {}", apiCalls.size());
 		final String contentType = message.getContentType();
 
 		switch (contentType) {
 			case Value.API_RESPONSE:
-				log.debug("Api response received [{}]", message);
+				log.info("[RECV] API_RESPONSE - polling from apiCalls queue");
 				CompletableFuture<EslMessage> apiCall = apiCalls.poll();
 				if (apiCall != null) {
+					log.info("[RECV] API_RESPONSE - completing future");
 					apiCall.complete(message);
+				} else {
+					log.warn("[RECV] API_RESPONSE - no future found in queue!");
 				}
 				break;
 
 			case Value.COMMAND_REPLY:
-				log.debug("Command reply received [{}]", message);
+				log.info("[RECV] COMMAND_REPLY - polling from apiCalls queue");
 				CompletableFuture<EslMessage> cmdCall = apiCalls.poll();
 				if (cmdCall != null) {
+					log.info("[RECV] COMMAND_REPLY - completing future with reply: {}", message.getHeaderValue(Name.REPLY_TEXT));
 					cmdCall.complete(message);
+				} else {
+					log.warn("[RECV] COMMAND_REPLY - no future found in queue!");
 				}
 				break;
 
 			case Value.AUTH_REQUEST:
-				log.debug("Auth request received [{}]", message);
+				log.info("[RECV] AUTH_REQUEST");
 				handleAuthRequest(socket);
 				break;
 
 			case Value.TEXT_DISCONNECT_NOTICE:
-				log.debug("Disconnect notice received [{}]", message);
+				log.info("[RECV] TEXT_DISCONNECT_NOTICE");
 				handleDisconnectionNotice();
 				break;
 
 			default:
-				log.warn("Unexpected message content type [{}]", contentType);
+				log.warn("[RECV] Unexpected message content type [{}]", contentType);
 				break;
 		}
 	}
@@ -198,6 +212,8 @@ public abstract class AbstractEslClientHandler {
 		try {
 			syncLock.lock();
 			apiCalls.add(future);
+			log.info("[SEND] Adding future to apiCalls queue (size now: {})", apiCalls.size());
+			log.info("[SEND] Sending command: {}", sb.toString().replace("\n", "\\n"));
 			socket.writeAndFlush(sb.toString());
 		} catch (IOException e) {
 			apiCalls.poll();
@@ -207,6 +223,30 @@ public abstract class AbstractEslClientHandler {
 		}
 
 		return future;
+	}
+
+	/**
+	 * Send a multi-line command without expecting a response.
+	 * Used in outbound async mode where sendmsg commands don't return replies.
+	 *
+	 * @param socket       the socket wrapper
+	 * @param commandLines the command lines to send
+	 */
+	public void sendCommandWithoutResponse(SocketWrapper socket, final List<String> commandLines) {
+		//  Build command with double line terminator at the end
+		final StringBuilder sb = new StringBuilder();
+		for (final String line : commandLines) {
+			sb.append(line);
+			sb.append(LINE_TERMINATOR);
+		}
+		sb.append(LINE_TERMINATOR);
+
+		try {
+			log.info("[SEND-ASYNC] Sending command without expecting response: {}", sb.toString().replace("\n", "\\n"));
+			socket.writeAndFlush(sb.toString());
+		} catch (IOException e) {
+			log.error("[SEND-ASYNC] Failed to send command", e);
+		}
 	}
 
 	/**

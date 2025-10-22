@@ -27,3 +27,53 @@ dependencies {
 tasks.named('test') {
     useJUnitPlatform()
 }
+
+// Task to run the OutboundServerExample
+tasks.register('runOutboundExample', JavaExec) {
+    description = 'Run the FreeSWITCH Event Socket Outbound Server Example'
+    group = 'application'
+
+    // Use test classpath to include both main and test classes
+    classpath = sourceSets.test.runtimeClasspath
+
+    // Main class to execute
+    mainClass = 'OutboundServerExample'
+
+    // Enable standard input (for Ctrl+C handling)
+    standardInput = System.in
+
+    // JVM arguments (optional)
+    jvmArgs = ['-XX:+ShowCodeDetailsInExceptionMessages']
+
+    // Pass command line arguments to the application
+    // Usage: gradle runOutboundExample --args="localhost 8021 ClueCon 8084"
+    if (project.hasProperty('args')) {
+        args = project.property('args').split()
+    }
+}
+
+// Task to run integration tests
+tasks.register('integrationTest', Test) {
+    description = 'Runs integration tests against real FreeSWITCH instance'
+    group = 'verification'
+
+    useJUnitPlatform()
+
+    // Run only the IntegrationTest class
+    filter {
+        includeTestsMatching 'IntegrationTest'
+    }
+
+    // Show test output in console
+    testLogging {
+        events 'passed', 'skipped', 'failed', 'standardOut', 'standardError'
+        exceptionFormat 'full'
+        showStandardStreams = true
+    }
+
+    // Set timeout for long-running tests
+    timeout = Duration.ofMinutes(5)
+
+    // Ensure integration tests don't run as part of regular 'test' task
+    shouldRunAfter test
+}
